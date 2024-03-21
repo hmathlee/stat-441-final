@@ -12,3 +12,9 @@ https://www.kaggle.com/competitions/w2024-kaggle-contest/overview.
 - Run each classifier on the resulting dataset
 - Compare cross-validation results
 - Use best model for test set prediction
+
+## To-Do:
+
+- Implement cross-validation for each model
+- Predict on test set with model with best logloss
+- Submit test set predictions

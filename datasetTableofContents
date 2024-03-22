@@ -1,0 +1,49 @@
+Table of Contents for the codebook:
+v1 - v8: Overall state of things
+v9 - v21: Communities you belong to
+v22 - v30c: Perception of neighbors
+v31 - v37: Trust in people
+v38 - v39: Satisfcation of life
+v40 - v50: Questions on work
+v51 - v64: Questions on religious beliefs
+v65 - v71: Questions on marriage
+v72 - v78_DE: Questions on women's role
+v79 - v79_DE: Making parents proud
+v80 - v81: Job scarcity
+v82: Homosexuality
+v83 - v96b: Questions on children
+v97 - v111_4: Questions on politics
+v112 - v132: Questions on society
+v133 - v143: Questions on democracy
+v144 - v148: Questions on political systems
+v149 - v163: Justifications on topics
+v164 - v171: Feelings of Belonging
+v172 - v183_DK: Questions on political activity
+v184 - v198: Questions on immigration
+v199 - v204: Questions on the environment
+v205 - v211: Questions on politics in the media
+v212 - v224_DK: Concerns about issues
+v225 - v233b_r: Information on the interviewee
+v234 - v237: Information on marital status
+v238 - v241: Information on household
+v242 - v243_cs_GB2: Information on level of education
+v244 - v249: Information on employment status
+v250 - v261_r: Information on partner
+v262_edulvlb - v274: Information on parents
+v275b_N2 - v282: Information on interview
+
+String Type Columns:
+
+c_abrv,v228b,v231b,v233b,v251b,v275b_N2,v275b_N1,v281a
+
+
+Missing Values:
+
+1 for v228b_r - respondants country of birth
+Row: 22670
+3 for v231b_r - fathers country of birth
+Rows: 6978, 39118, 27310
+2 for v233b_r - mothers country of birth
+Rows: 39118, 16312
+4 for v251b_r -  country of birth by ISO code
+Rows: 39118, 29908, 35708, 34947

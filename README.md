@@ -1,12 +1,10 @@
 # STAT 441 Final Project
 
-Winter 2024.
-
 ## Overview
 
-https://www.kaggle.com/competitions/w2024-kaggle-contest/overview.
+The goal of this project was to answer the question "How religiuos are you?" The response is measured in five categories: "no answer", "very important", "quite important", "not important", or "not at all important". Our team's final submission is part of a Kaggle competition; more details can be found here: https://www.kaggle.com/competitions/w2024-kaggle-contest/overview.
 
-## Workflow
+## Methodology
 
 - Use lasso regression for variable selection
 - Run each classifier on the resulting dataset

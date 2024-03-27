@@ -1,76 +1,35 @@
-from yaml import safe_load
-
-import numpy as np
-from xgboost import train, DMatrix
+# Scikit-Learn
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import log_loss, accuracy_score
+from sklearn.ensemble import BaggingClassifier
 from sklearn.svm import SVC
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import log_loss, accuracy_score
 
+# Torch
 import torch
 from torch.utils.data import DataLoader
 from torch.optim import SGD
 import torch.nn.functional as F
 from torch import nn
 
-from utils import categorical_dmatrix, pandas2torch, L2_regularize
+# Data
+import pandas as pd
+import numpy as np
 
-cfg = safe_load(open("config.yaml", 'r'))
+# File utils
+from yaml import safe_load
 
+# Custom
+from utils import pandas2torch
 
-class Model:
-    def __init__(self):
-        self.one_hot_encode = True
-        self.feature_select = True
-        self.scale = True
-
-    def cross_val(self):
-        pass
-
-    def default_preprocessor(self):
-        return self.one_hot_encode and self.feature_select and self.scale
+# Config
+cfg = safe_load(open("../config.yaml", "r"))
 
 
-class XGBoost(Model):
-    def __init__(self):
-        super().__init__()
-        self.model = "xgboost"
-        self.trained = None
-
-        self.one_hot_encode = False
-        self.feature_select = False
-        self.scale = True
-
-    def train(self, X_train, y_train, X_val, y_val):
-        y_train = y_train.replace(-1, 0)
-        y_val = y_val.replace(-1, 0)
-
-        dtrain = DMatrix(categorical_dmatrix(X_train), label=y_train, enable_categorical=True)
-        dval = DMatrix(categorical_dmatrix(X_val), label=y_val, enable_categorical=True)
-
-        xgb = cfg["XGBOOST"]
-        params = {'max_depth': xgb["DEPTH"], 'eta': xgb["LR"], 'num_class': xgb["N_CLASS"],
-                  'objective': 'multi:softmax', 'eval_metric': 'mlogloss'}
-        evals = [(dtrain, "train"), (dval, "val")]
-        evals_result = {}
-
-        model = train(params, dtrain, num_boost_round=xgb["ROUNDS"], evals=evals, evals_result=evals_result)
-        self.trained = model
-
-        val_pred = model.predict(dval)
-
-        return {
-            "logloss":  list(evals_result["val"]["mlogloss"])[-1],
-            "accuracy": accuracy_score(y_val, val_pred)
-        }
-
-
-class Logistic(Model):
+class Logistic():
     def __init__(self):
         super().__init__()
         self.model = "logistic"
-        self.one_hot_encode = True
-        self.feature_select = True
-        self.scale = True
 
     def train(self, X_train, y_train, X_val, y_val):
         model = LogisticRegression().fit(X_train, y_train)
@@ -82,24 +41,63 @@ class Logistic(Model):
         }
 
 
-class SVM(Model):
+class SVM():
     def __init__(self):
         super().__init__()
         self.model = "svm"
-        self.one_hot_encode = True
-        self.feature_select = True
-        self.scale = True
+        self.trained = None
 
     def train(self, X_train, y_train, X_val, y_val):
-        model = SVC(gamma="auto", kernel="rbf", decision_function_shape="ovr")
+        # Ensemble SVMs on subsets of data to speed up training
+        model = BaggingClassifier(SVC(gamma="auto", kernel="rbf", decision_function_shape="ovo"),
+                                  n_estimators=cfg["SVM"]["ROUNDS"], max_samples=cfg["SVM"]["SUBSAMPLE"],
+                                  n_jobs=cfg["N_JOBS"])
+
         model.fit(X_train, y_train)
-        val_score = model.decision_function(X_val)
+        self.trained = model
+
+        print("Calibrating probabilities...")
+        calibrated = CalibratedClassifierCV(model, n_jobs=cfg["N_JOBS"], cv="prefit")
+        calibrated.fit(X_train, y_train)
+
+        # Training metrics
+        train_score = calibrated.predict_proba(X_train)
+        train_pred = 1 / (1 + np.exp(-train_score))
+        pred_class = np.argmax(train_pred, axis=1)
+        train_loss = log_loss(y_train, train_pred)
+        train_acc = accuracy_score(y_train, pred_class)
+
+        # Val metrics
+        val_score = calibrated.predict_proba(X_val)
         val_pred = 1 / (1 + np.exp(-val_score))
         pred_class = np.argmax(val_pred, axis=1)
+        val_loss = log_loss(y_val, val_pred)
+        val_acc = accuracy_score(y_val, pred_class)
+
+        print("Training loss: {} | Val loss: {}".format(train_loss, val_loss))
+        print("Training acc: {} | Val acc: {}".format(train_acc, val_acc))
+
         return {
-            "logloss": log_loss(y_val, val_pred),
-            "accuracy": accuracy_score(y_val, pred_class)
+            "logloss": val_loss,
+            "accuracy": val_acc
         }
+
+    def predict(self, X_test):
+        pred = self.trained.predict_proba(X_test)
+
+        # Retrieve column names for prediction dataframe
+        names_file = open("names.txt", "r")
+        columns = names_file.readlines()
+        names_file.close()
+
+        # Remove the newline characters
+        for i in range(len(columns) - 1):
+            columns[i] = columns[i][:-1]
+
+        # Construct prediction dataframe
+        pred_df = pd.DataFrame(pred, columns=columns)
+
+        return pred_df
 
 
 class NN(nn.Module):
@@ -109,10 +107,8 @@ class NN(nn.Module):
         # self.b2 = nn.BatchNorm1d(dims[1])
         self.fc1 = nn.Linear(dims[0], dims[1])
         self.fc2 = nn.Linear(dims[1], dims[2])
-
-        # Initialize weights
-        torch.nn.init.kaiming_normal_(self.fc1.weight)
-        torch.nn.init.kaiming_normal_(self.fc2.weight)
+        self.fc3 = nn.Linear(dims[2], dims[3])
+        self.fc4 = nn.Linear(dims[3], dims[4])
 
     def forward(self, x):
         # x = self.b1(x)
@@ -120,15 +116,22 @@ class NN(nn.Module):
         x = self.fc1(x)
         x = F.relu(x)
 
-        # x = self.b2(x)
         x = nn.Dropout(cfg["NN"]["DROPOUT"])(x)
         x = self.fc2(x)
-        x = F.softplus(x)
+        x = F.relu(x)
 
-        return F.log_softmax(x, dim=1)
+        x = nn.Dropout(cfg["NN"]["DROPOUT"])(x)
+        x = self.fc3(x)
+        x = F.relu(x)
+
+        x = nn.Dropout(cfg["NN"]["DROPOUT"])(x)
+        x = self.fc4(x)
+        x = F.log_softmax(x, dim=1)
+
+        return x
 
 
-class NeuralNetwork(Model):
+class NeuralNetwork():
     def __init__(self):
         super().__init__()
         self.net = None
@@ -138,6 +141,8 @@ class NeuralNetwork(Model):
         self.one_hot_encode = True
         self.feature_select = False
         self.scale = True
+        self.feature_engineer = True
+        self.correlation = True
 
     def train_one_epoch(self, train_loader, optim, loss_fn):
         loss_sum = 0
@@ -162,10 +167,13 @@ class NeuralNetwork(Model):
         return loss_sum / len(train_loader)
 
     def train(self, X_train, y_train, X_val, y_val):
+        torch.set_num_threads(6)
+
         input_dim = len(X_train.columns)
-        hidden_dim = cfg["NN"]["H_DIM"]
+        hidden_dims = cfg["NN"]["H_DIM"]
         output_dim = y_train.nunique()
-        self.net = NN([input_dim, hidden_dim, output_dim]).to(self.device)
+        dims = [input_dim] + hidden_dims + [output_dim]
+        self.net = NN(dims).to(self.device)
 
         dtrain = pandas2torch(X_train, y_train)
         dval = pandas2torch(X_val, y_val)
@@ -217,3 +225,6 @@ class NeuralNetwork(Model):
             "logloss": best_val_loss,
             "acc": curr_acc
         }
+
+    def predict(self, X_test):
+        pass

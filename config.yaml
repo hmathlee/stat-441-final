@@ -1,0 +1,63 @@
+# Paths
+X_TRAIN: "data/X_train.csv"
+Y_TRAIN: "data/y_train.csv"
+X_TEST: "data/X_test.csv"
+
+# Random
+SEED: 420
+
+# Set this to your number of cores
+N_JOBS: 6
+
+# Data
+TRAIN: 0.7
+VAL: 0.2
+PRE_TEST: 0.1
+
+# Feature selection
+LASSO:
+  ALPHA: 0.01
+
+# Models
+XGBOOST:
+  SELECTION:
+    DEPTH: [3]
+    LR: [0.05]
+    N_CLASS: 5
+    ROUNDS: 500
+    SUBSET: 1
+    SUBSAMPLE: 1
+    IMP_THRESH: 0.002
+    CATEGORICAL: True
+    MIN_CHILD_WGT: [50]
+
+  PREDICTION:
+    DEPTH: [3]
+    LR: [0.04]
+    N_CLASS: 5
+    ROUNDS: 500
+    SUBSET: 1
+    SUBSAMPLE: 1
+    CATEGORICAL: True
+    MIN_CHILD_WGT: [25]
+
+SVM:
+  SUBSAMPLE: 0.5
+  ROUNDS: 10
+
+NN:
+  H_DIM: [128, 500, 1000, 500, 128]
+  BATCH_SIZE: 512
+  DROPOUT: 0.2
+  EPOCHS: 1000
+  LR: 0.002
+  L2_REG: 0.01
+  MOMENTUM: 0.9
+  LR_CYCLE: 250
+
+  RPROP_LR: 0.03
+
+RF:
+  N_TREES: 2000
+  MAX_FTRS: 25
+  MIN_CHILD_WGT: 50

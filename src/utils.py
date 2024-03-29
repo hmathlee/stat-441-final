@@ -2,10 +2,12 @@
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import log_loss, accuracy_score
 
 # File utils
 import os
 from yaml import safe_load
+from joblib import dump, load
 
 # Torch
 from torch import Tensor
@@ -13,6 +15,7 @@ from torch.utils.data import TensorDataset
 from torch.nn.functional import normalize
 
 cfg = safe_load(open("config.yaml", 'r'))
+model_out = cfg["MODEL_OUT"]
 
 # Set seed
 rng = np.random.default_rng(cfg["SEED"])
@@ -105,19 +108,30 @@ def feature_transform(X):
 
     X = X.drop(columns=["v108", "v109", "v110", "v111"])
 
+    dk_vars = ["v176", "v177", "v178", "v179", "v180", "v181", "v182", "v183", "v221", "v222", "v223", "v224"]
+    for var in dk_vars:
+        dk = X[var + "_DK"]
+        dk_response_idx = (dk != -4)
+        X[var][dk_response_idx] = dk[dk_response_idx]
+
+    X = X.drop(columns=[var + "_DK" for var in dk_vars])
+
+    # Handle the continuous income variable separately
+    income_continuous = X["v261_ppp"]
+    X = X.drop(columns=["v261_ppp"])
+    mean, std = income_continuous.mean(), income_continuous.std()
+    income_continuous = (income_continuous - mean) / std
+    X["v261_ppp"] = income_continuous
+
     # Add/subtract DK (don't know) values based on topic: subtract if higher rating means individual perceives a
     # high level of corruption in their country; add otherwise
     to_subtract = ["v176", "v180", "v181"]
     to_add = ["v177", "v178", "v179", "v182", "v183"]
     corruption = X[to_add].sum(axis=1) - X[to_subtract].sum(axis=1)
 
-    # Compute corruption values for both the original and "don't know" responses
-    to_subtract = [var + "_DK" for var in to_subtract]
-    to_add = [var + "_DK" for var in to_add]
-    corruption_dk = X[to_add].sum(axis=1) - X[to_subtract].sum(axis=1)
-
     # Replace these variables with the corruption feature
-    X = X.assign(corruption=(corruption + corruption_dk))
+    # X = X.assign(corruption=(corruption + corruption_dk))
+    X = X.assign(corruption=corruption)
     X = X.drop(columns=to_add)
     X = X.drop(columns=to_subtract)
 
@@ -182,8 +196,8 @@ def preprocess(X_train, y_train, X_test, val_idx, preproc_dir=None):
     X_train, y_train, X_val, y_val = train_val_split(X_train, y_train, val_idx)
 
     # Write the dfs to .csv files if applicable
-    if preproc_dir:
-        if len(os.listdir("preprocessed")) == 0 and not os.path.exists(preproc_dir):
+    if len(os.listdir("preprocessed")) == 0 and preproc_dir:
+        if not os.path.exists(preproc_dir):
             os.makedirs(preproc_dir)
 
             X_train_path = os.path.join(preproc_dir, "X_train.csv")
@@ -206,6 +220,8 @@ def categorical_dmatrix(X):
     for var in X.columns:
         if X[var].dtype == "O":
             X[var] = X[var].astype("category")
+        elif X[var].dtype == "bool":
+            X[var] = X[var].astype(int)
     return X
 
 
@@ -249,14 +265,9 @@ def write_pred_csv(pred_df, dest):
 def pandas2numpy(X_train, X_val, X_test):
     # One-hot-encode
     X = pd.concat([X_train, X_val, X_test])
-    X = label_encode(X)
+    X = pd.get_dummies(X)
 
     n_train, n_val = len(X_train), len(X_val)
-
-    # Scale features between 0 and 1
-    mean = np.tile(np.mean(X, axis=1), (X.shape[1], 1)).transpose()
-    std = np.tile(np.std(X, axis=1), (X.shape[1], 1)).transpose()
-    X = X * mean / std
 
     X_train = X.iloc[:n_train]
     X_val = X.iloc[n_train:n_train+n_val]
@@ -265,21 +276,78 @@ def pandas2numpy(X_train, X_val, X_test):
     return np.array(X_train), np.array(X_val), np.array(X_test)
 
 
-def pandas2torch(X, y):
-    X = label_encode(X)
-    # Cast booleans in X to ints (for numpy conversion)
-    for var in X.columns:
-        if X[var].dtype == "bool":
-            X[var] = X[var].astype(int)
-
-    X_tensor = Tensor(X.to_numpy())
-    y_tensor = Tensor(y.to_numpy())
-    return TensorDataset(normalize(X_tensor), y_tensor)
+# Convenience function for saving models
+def save_model_as_joblib(model):
+    model_path = os.path.join(model_out, model.model + ".pkl")
+    dump(model.trained, model_path)
 
 
-def label_encode(X):
-    le = LabelEncoder()
-    for var in X.columns:
-        if X[var].dtype in ["object", "category"]:
-            X[var] = le.fit_transform(X[var])
-    return X
+# Convenience function for saving confusion matrix .csv
+def save_confusion_matrix_csv(y_true, y_pred, out_path):
+    assert y_true.shape == y_pred.shape, \
+        "y_true and y_pred are not the same shape; got {} and {}.".format(y_true.shape, y_pred.shape)
+    y_true_s = pd.Series(y_true, name="Label")
+    y_pred_s = pd.Series(y_pred, name="Prediction")
+    df = pd.crosstab(y_true_s, y_pred_s)
+    df.to_csv(out_path)
+
+
+def report_validation_metrics(model, X_val, y_val):
+    val_pred = model.trained.predict_proba(X_val)
+    val_pred_class = np.argmax(val_pred, axis=1)
+    conf_mat_out = os.path.join("confusion", model.model + "_confusion_matrix.csv")
+    save_confusion_matrix_csv(y_val, val_pred_class, conf_mat_out)
+
+    return {
+        "logloss": log_loss(y_val, val_pred),
+        "accuracy": accuracy_score(y_val, val_pred_class)
+    }
+
+
+def preprocess_xgboost(X_train, y_train, X_test, val_idx, preproc_dir=None):
+    # Replace -1's in y_train with 0's
+    y_train = y_train.replace(-1, 0)
+
+    # The drop() function removes variables with only one unique value; this is checked across all observations,
+    # i.e. both train and test sets
+    print("Removing constant, modified, and flagged variables...")
+    X = pd.concat([X_train, X_test])
+    X = drop(X)
+
+    dk_vars = ["v176", "v177", "v178", "v179", "v180", "v181", "v182", "v183", "v221", "v222", "v223", "v224"]
+    for var in dk_vars:
+        dk = X[var + "_DK"]
+        dk_response_idx = (dk != -4)
+        X[var][dk_response_idx] = dk[dk_response_idx]
+
+    X = X.drop(columns=[var + "_DK" for var in dk_vars])
+
+    # Retrieve the train and test sets
+    X_train = X.iloc[:len(X_train)]
+    X_test = X.iloc[len(X_train):]
+
+    # Train-val split
+    print("Generating a train-val data split...")
+    X_train, y_train, X_val, y_val = train_val_split(X_train, y_train, val_idx)
+
+    # Write the dfs to .csv files if applicable
+    if len(os.listdir("preprocessed")) == 0 and preproc_dir:
+        if not os.path.exists(preproc_dir):
+            os.makedirs(preproc_dir)
+
+            X_train_path = os.path.join(preproc_dir, "X_train.csv")
+            X_val_path = os.path.join(preproc_dir, "X_val.csv")
+            X_test_path = os.path.join(preproc_dir, "X_test.csv")
+
+            X_train.to_csv(X_train_path, index=False)
+            X_val.to_csv(X_val_path, index=False)
+            X_test.to_csv(X_test_path, index=False)
+
+            print("Preprocessed datasets saved to")
+            print("-- X_train: {}".format(X_train_path))
+            print("-- X_val: {}".format(X_val_path))
+            print("-- X_test: {}".format(X_test_path))
+
+    return X_train, y_train, X_val, y_val, X_test
+
+

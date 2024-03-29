@@ -1,39 +1,62 @@
+import os
 from yaml import safe_load
+from joblib import load
 
-import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 from xgboost import XGBClassifier
-from sklearn.metrics import log_loss, accuracy_score
 from sklearn.model_selection import GridSearchCV
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, StackingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import BaggingClassifier
+from sklearn.svm import SVC
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import log_loss, accuracy_score
+from sklearn.neighbors import KNeighborsClassifier
+# from sklearn.utils.class_weight import compute_sample_weight
 
 # Torch
 import torch
 from torch.utils.data import DataLoader
-from torch.optim import SGD, Adam, Rprop
+from torch.optim import Rprop
 import torch.nn.functional as F
 from torch import nn
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 
 from tqdm import tqdm
 
 # Custom
-from utils import pandas2torch
+from utils import save_model_as_joblib, report_validation_metrics, categorical_dmatrix
+from legacy.utils import pandas2torch
 
-cfg = safe_load(open("config.yaml", 'r'))
+cfg = safe_load(open("config.yaml", "r"))
+model_out = cfg["MODEL_OUT"]
 
 rng = np.random.default_rng(cfg["SEED"])
 
 
-class XGBoost():
-    def __init__(self):
+class XGBoost:
+    def __init__(self, xgb_cfg, from_pickle=False):
         super().__init__()
         self.model = "xgboost"
-        self.trained = None
+        self.xgb_cfg = xgb_cfg
 
-    def train(self, X_train, y_train, X_val, y_val, xgb_cfg, cv=True, pre_test=None):
+        if from_pickle:
+            self.trained = load(os.path.join(model_out, self.model + ".pkl"))
+        else:
+            self.trained = XGBClassifier(n_estimators=self.xgb_cfg["ROUNDS"], objective="multi:softprob",
+                                         eval_metric="mlogloss", enable_categorical=self.xgb_cfg["CATEGORICAL"],
+                                         tree_method="hist", colsample_bytree=self.xgb_cfg["SUBSET"],
+                                         n_jobs=cfg["N_JOBS"])
+
+            # Set tuning parameters
+            self.trained.set_params(max_depth=self.xgb_cfg["DEPTH"][0], learning_rate=self.xgb_cfg["LR"][0],
+                                    min_child_weight=self.xgb_cfg["MIN_CHILD_WGT"][0])
+
+    def train(self, X_train, y_train, X_val, y_val, pre_test=None):
+        X_train = categorical_dmatrix(X_train)
+        X_val = categorical_dmatrix(X_val)
+
         X_pre_test, y_pre_test = None, None
 
         # If we want to set aside a preemptive test set for further evaluation purposes
@@ -52,46 +75,19 @@ class XGBoost():
         # Watchlist (monitor over-fitting)
         eval_set = [(X_train_new, y_train_new), (X_val, y_val)]
 
-        # Define the model with parameters from the config file
-        model = XGBClassifier(n_estimators=xgb_cfg["ROUNDS"], objective="multi:softprob", eval_metric="mlogloss",
-                              enable_categorical=xgb_cfg["CATEGORICAL"], tree_method="hist",
-                              colsample_bytree=xgb_cfg["SUBSET"], n_jobs=cfg["N_JOBS"], early_stopping_rounds=50)
-
-        params = {"max_depth": xgb_cfg["DEPTH"], "eta": xgb_cfg["LR"], "min_child_weight": xgb_cfg["MIN_CHILD_WGT"]}
-
-        # Grid search cross-validation
-        if cv:
-            xgb_search = GridSearchCV(model, params, n_jobs=cfg["N_JOBS"])
-            xgb_search.fit(X_train_new, y_train_new, eval_set=eval_set, verbose=2)
-
-            best_model = xgb_search.best_estimator_
-            self.trained = best_model
-
-            # Output best set of parameters
-            for param in xgb_search.best_params_:
-                print("{}: {}".format(param, xgb_search.best_params_[param]))
-
         # Single train-test pass
-        else:
-            assert len(xgb_cfg["DEPTH"]) == 1, \
-                "Depth parameter has length {} when 1 is required.".format(len(xgb_cfg["DEPTH"]))
-            assert len(xgb_cfg["LR"]) == 1, \
-                "Learning rate parameter has length {} when 1 is required.".format(len(xgb_cfg["LR"]))
-            assert len(xgb_cfg["MIN_CHILD_WGT"]) == 1, \
-                "Min child wgt parameter has length {} when 1 is required.".format(len(xgb_cfg["MIN_CHILD_WGT"]))
+        assert len(self.xgb_cfg["DEPTH"]) == 1, \
+            "Depth parameter has length {} when 1 is required.".format(len(self.xgb_cfg["DEPTH"]))
+        assert len(self.xgb_cfg["LR"]) == 1, \
+            "Learning rate parameter has length {} when 1 is required.".format(len(self.xgb_cfg["LR"]))
+        assert len(self.xgb_cfg["MIN_CHILD_WGT"]) == 1, \
+            "Min child wgt parameter has length {} when 1 is required.".format(len(self.xgb_cfg["MIN_CHILD_WGT"]))
 
-            model.set_params(max_depth=xgb_cfg["DEPTH"][0], learning_rate=xgb_cfg["LR"][0],
-                             min_child_weight=xgb_cfg["MIN_CHILD_WGT"][0])
-            self.trained = model.fit(X_train_new, y_train_new, eval_set=eval_set)
+        # weights = compute_sample_weight("balanced", y=y_train_new)
+        self.trained = self.trained.fit(X_train_new, y_train_new, eval_set=eval_set)
 
-        # Evaluate best model on preemptive test set
-        val_pred = self.trained.predict_proba(X_val)
-        val_pred_class = np.argmax(val_pred, axis=1)
-
-        eval_metrics = {
-            "logloss": log_loss(y_val, val_pred),
-            "accuracy": accuracy_score(y_val, val_pred_class)
-        }
+        save_model_as_joblib(self)
+        eval_metrics = report_validation_metrics(self, X_val, y_val)
 
         # Evaluation metrics on the preemptive test set, if applicable
         if pre_test > 0:
@@ -121,27 +117,28 @@ class XGBoost():
 
 
 class RandomForest:
-    def __init__(self):
-        self.trained = None
+    def __init__(self, from_pickle=False):
+        rf = cfg["RF"]
+        self.model = "random_forest"
+        if from_pickle:
+            self.trained = load(os.path.join(model_out, self.model + ".pkl"))
+        else:
+            self.trained = RandomForestClassifier(n_estimators=rf["N_TREES"], criterion="log_loss",
+                                                  max_depth=rf["MAX_DEPTH"], min_samples_leaf=rf["MIN_CHILD_WGT"],
+                                                  max_features=rf["MAX_FTRS"], n_jobs=cfg["N_JOBS"], verbose=1)
 
     def train(self, X_train, y_train, X_val, y_val):
-        rf = cfg["RF"]
-
-        self.trained = RandomForestClassifier(n_estimators=rf["N_TREES"], criterion="log_loss", max_depth=9,
-                                              min_samples_leaf=rf["MIN_CHILD_WGT"], max_features=rf["MAX_FTRS"],
-                                              n_jobs=cfg["N_JOBS"], verbose=1)
+        # Apply class weights
         self.trained.fit(X_train, y_train)
         train_pred = self.trained.predict_proba(X_train)
         train_pred_class = np.argmax(train_pred, axis=1)
         print("Random forest log loss (train):", log_loss(y_train, train_pred))
         print("Random forest accuracy (train):", accuracy_score(y_train, train_pred_class))
 
-        val_pred = self.trained.predict_proba(X_val)
-        pred_class = np.argmax(val_pred, axis=1)
-        return {
-            "logloss": log_loss(y_val, val_pred),
-            "accuracy": accuracy_score(y_val, pred_class)
-        }
+        save_model_as_joblib(self)
+        eval_metrics = report_validation_metrics(self, X_val, y_val)
+        
+        return eval_metrics
 
 
 class NN(nn.Module):
@@ -318,3 +315,167 @@ class NeuralNetwork:
 
     def predict(self, X_test):
         pass
+
+
+class Logistic:
+    def __init__(self, from_pickle=False):
+        super().__init__()
+        self.model = "logistic"
+
+        if from_pickle:
+            self.trained = load(os.path.join(model_out, self.model + ".pkl"))
+        else:
+            self.trained = LogisticRegression()
+
+    def train(self, X_train, y_train, X_val, y_val):
+        self.trained.fit(X_train, y_train)
+        
+        save_model_as_joblib(self)
+        eval_metrics = report_validation_metrics(self, X_val, y_val)
+        
+        return eval_metrics
+
+
+class KNearest:
+    def __init__(self, from_pickle=False):
+        self.model = "k_nearest"
+
+        if from_pickle:
+            self.trained = load(os.path.join(model_out, self.model + ".pkl"))
+        else:
+            self.trained = KNeighborsClassifier(n_neighbors=cfg["KNN"]["NEIGHBORS"])
+
+    def train(self, X_train, y_train, X_val, y_val):
+        self.trained.fit(X_train, y_train)
+        
+        save_model_as_joblib(self)
+        eval_metrics = report_validation_metrics(self, X_val, y_val)
+        
+        return eval_metrics
+
+
+class SVM:
+    def __init__(self, from_pickle=False):
+        super().__init__()
+        self.model = "svm"
+
+        if from_pickle:
+            self.trained = load(os.path.join(model_out, self.model + ".pkl"))
+        else:
+            # Ensemble SVMs on subsets of data to speed up training
+            self.trained = BaggingClassifier(SVC(gamma="auto", kernel="rbf", decision_function_shape="ovo"),
+                                             n_estimators=cfg["SVM"]["ROUNDS"], max_samples=cfg["SVM"]["SUBSAMPLE"],
+                                             n_jobs=cfg["N_JOBS"])
+
+    def train(self, X_train, y_train, X_val, y_val):
+        self.trained.fit(X_train, y_train)
+        save_model_as_joblib(self)
+
+        print("Calibrating probabilities...")
+        calibrated = CalibratedClassifierCV(self.trained, n_jobs=cfg["N_JOBS"], cv="prefit")
+        calibrated.fit(X_train, y_train)
+
+        # Training metrics
+        train_score = calibrated.predict_proba(X_train)
+        train_pred = 1 / (1 + np.exp(-train_score))
+        pred_class = np.argmax(train_pred, axis=1)
+        train_loss = log_loss(y_train, train_pred)
+        train_acc = accuracy_score(y_train, pred_class)
+
+        # Val metrics
+        val_score = calibrated.predict_proba(X_val)
+        val_pred = 1 / (1 + np.exp(-val_score))
+        pred_class = np.argmax(val_pred, axis=1)
+        val_loss = log_loss(y_val, val_pred)
+        val_acc = accuracy_score(y_val, pred_class)
+
+        print("Training loss: {} | Val loss: {}".format(train_loss, val_loss))
+        print("Training acc: {} | Val acc: {}".format(train_acc, val_acc))
+
+        return {
+            "logloss": val_loss,
+            "accuracy": val_acc
+        }
+
+    def predict(self, X_test):
+        pred = self.trained.predict_proba(X_test)
+
+        # Retrieve column names for prediction dataframe
+        names_file = open("names.txt", "r")
+        columns = names_file.readlines()
+        names_file.close()
+
+        # Remove the newline characters
+        for i in range(len(columns) - 1):
+            columns[i] = columns[i][:-1]
+
+        # Construct prediction dataframe
+        pred_df = pd.DataFrame(pred, columns=columns)
+
+        return pred_df
+
+
+class ModelStack:
+    def __init__(self, prefit=True, from_pickle=False):
+        self.model = "stack"
+
+        if from_pickle:
+            self.trained = load(os.path.join(model_out, self.model + ".pkl"))
+        else:
+            xgb_cfg = cfg["XGBOOST"]["PREDICTION"]
+            xgb = XGBoost(xgb_cfg)
+            rf = RandomForest()
+            svm = SVM()
+            knn = KNearest()
+            logistic = Logistic()
+
+            self.estimators = [
+                ("xgboost", xgb.trained),
+                ("random forest", rf.trained)
+                # ("svm", svm.trained),
+                # ("knn", knn.trained),
+                # ("logistic", logistic.trained)
+            ]
+
+            # Use XGBoost as the Level 1 estimator
+            xgb_cfg = cfg["XGBOOST"]["STACK"]
+            final_estimator = XGBClassifier(n_estimators=xgb_cfg["ROUNDS"], objective="multi:softprob",
+                                            eval_metric="mlogloss", enable_categorical=xgb_cfg["CATEGORICAL"],
+                                            tree_method="hist", colsample_bytree=xgb_cfg["SUBSET"],
+                                            n_jobs=cfg["N_JOBS"])
+            final_estimator.set_params(max_depth=xgb_cfg["DEPTH"][0], learning_rate=xgb_cfg["LR"][0],
+                                       min_child_weight=xgb_cfg["MIN_CHILD_WGT"][0])
+            # final_estimator = LogisticRegression()
+
+            cv = "prefit" if prefit else 2
+            self.trained = StackingClassifier(estimators=self.estimators, final_estimator=final_estimator, cv=cv,
+                                              verbose=2, n_jobs=cfg["N_JOBS"])
+
+    def train(self, X_train, y_train, X_val, y_val):
+        self.trained.fit(X_train, y_train)
+        save_model_as_joblib(self)
+
+        train_pred = self.trained.predict_proba(X_train)
+        train_pred_class = np.argmax(train_pred, axis=1)
+        print("Stacked log loss (train):", log_loss(y_train, train_pred))
+        print("Stacked accuracy (train):", accuracy_score(y_train, train_pred_class))
+
+        eval_metrics = report_validation_metrics(self, X_val, y_val)
+        return eval_metrics
+
+    def predict(self, X_test):
+        pred = self.trained.predict_proba(X_test)
+
+        # Retrieve column names for prediction dataframe
+        names_file = open("names.txt", "r")
+        columns = names_file.readlines()
+        names_file.close()
+
+        # Remove the newline characters
+        for i in range(len(columns) - 1):
+            columns[i] = columns[i][:-1]
+
+        # Construct prediction dataframe
+        pred_df = pd.DataFrame(pred, columns=columns)
+
+        return pred_df

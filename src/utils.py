@@ -2,26 +2,48 @@
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import log_loss, accuracy_score
 
 # File utils
 import os
 from yaml import safe_load
-from joblib import dump, load
+from joblib import dump
 
-# Torch
-from torch import Tensor
-from torch.utils.data import TensorDataset
-from torch.nn.functional import normalize
+from collections import Counter
+import random
 
 cfg = safe_load(open("config.yaml", 'r'))
 model_out = cfg["MODEL_OUT"]
 
 # Set seed
 rng = np.random.default_rng(cfg["SEED"])
+random.seed(cfg["SEED"])
 
 
-def read_csv_data(X_train_path, y_train_path, X_test_path, val):
+def stratified_train_val_split(X, y):
+    full_df = pd.concat([X, y], axis=1)
+    full_df = full_df.reset_index(drop=True)
+    dtrain, dval = None, None
+    labels = y.unique()
+
+    for label in labels:
+        df_with_label = full_df[full_df["label"] == label]
+        train, val = train_test_split(df_with_label, test_size=int(len(df_with_label) * cfg["VAL"]),
+                                      random_state=cfg["SEED"])
+        dtrain = train if dtrain is None else pd.concat([dtrain, train])
+        dval = val if dval is None else pd.concat([dval, val])
+
+    X_train = dtrain.drop(columns=["label"])
+    X_val = dval.drop(columns=["label"])
+
+    y_train = dtrain["label"]
+    y_val = dval["label"]
+
+    return X_train, y_train, X_val, y_val
+
+
+def read_csv_data(X_train_path, y_train_path, X_test_path):
     # Read in the dataset
     X_train = pd.read_csv(X_train_path)
     X_test = pd.read_csv(X_test_path)
@@ -31,11 +53,7 @@ def read_csv_data(X_train_path, y_train_path, X_test_path, val):
     X_train = X_train.dropna(axis=0)
     y_train = y_train.iloc[X_train.index]
 
-    # (val)% of all data set aside for validation
-    n_val = int(val * (len(X_train) + len(X_test)))
-    val_idx = rng.choice(np.arange(len(X_train)), n_val, replace=False)
-
-    return X_train, y_train, X_test, list(val_idx)
+    return X_train, y_train, X_test
 
 
 def train_val_split(X_train, y_train, val_idx):
@@ -83,73 +101,14 @@ def feature_transform(X):
     fw_duration = fw_end - fw_start
     X = X.assign(fw_duration=fw_duration)
     X = X.drop(columns=["fw_start", "fw_end"])
-
-    # Aggregate some integer-encoded categorical variables (not of type "object")
-    X = eliminate_variables(X, "v22", "v31", "neighbor_discrim")
-    X = eliminate_variables(X, "v31", "v38", "distrust")
-    X = eliminate_variables(X, "v40", "v45a", "job_standard")
-    X = eliminate_variables(X, "v46", "v51", "work_ethic")
-    X = eliminate_variables(X, "v72", "v79", "patriarch_belief")
-    X = eliminate_variables(X, "v83", "v96", "children_virtues")
-    X = eliminate_variables(X, "v97", "v102", "poli_activism")
-    X = eliminate_variables(X, "v115", "v133", "society_conf")
-    X = eliminate_variables(X, "v133", "v144", "democracy")
-    X = eliminate_variables(X, "v146", "v149", "poli_system")
-    X = eliminate_variables(X, "v164", "v171", "community")
-
-    # Subtract each of the "none mentioned" variables from their relevant groups
-    X = zero_out_negatives(X, "v45a")
-    X["job_standard"] = X["job_standard"] - X["v45a"]
-    X = X.drop(columns=["v45a"])
-
-    X = zero_out_negatives(X, "v96")
-    X["children_virtues"] = X["children_virtues"] - X["v96"]
-    X = X.drop(columns=["v96"])
-
-    X = X.drop(columns=["v108", "v109", "v110", "v111"])
-
-    dk_vars = ["v176", "v177", "v178", "v179", "v180", "v181", "v182", "v183", "v221", "v222", "v223", "v224"]
-    for var in dk_vars:
-        dk = X[var + "_DK"]
-        dk_response_idx = (dk != -4)
-        X[var][dk_response_idx] = dk[dk_response_idx]
-
-    X = X.drop(columns=[var + "_DK" for var in dk_vars])
-
-    # Handle the continuous income variable separately
-    income_continuous = X["v261_ppp"]
-    X = X.drop(columns=["v261_ppp"])
-    mean, std = income_continuous.mean(), income_continuous.std()
-    income_continuous = (income_continuous - mean) / std
-    X["v261_ppp"] = income_continuous
-
-    # Add/subtract DK (don't know) values based on topic: subtract if higher rating means individual perceives a
-    # high level of corruption in their country; add otherwise
-    to_subtract = ["v176", "v180", "v181"]
-    to_add = ["v177", "v178", "v179", "v182", "v183"]
-    corruption = X[to_add].sum(axis=1) - X[to_subtract].sum(axis=1)
-
-    # Replace these variables with the corruption feature
-    # X = X.assign(corruption=(corruption + corruption_dk))
-    X = X.assign(corruption=corruption)
-    X = X.drop(columns=to_add)
-    X = X.drop(columns=to_subtract)
-
-    # Select variables up to 224_DK, along with the new variables we selected
-    # Specify the new feature name as None to not make a new aggregate variable
-    X = eliminate_variables(X, "v225", "fw_duration", None)
+    X["fw_duration"] = X["fw_duration"].astype(float)
 
     return X
 
 
 def drop(X):
-    """
-    Drop variables with zero variance and/or whose values are modified/flagged
-    :param X: pd.DataFrame; original dataset.
-    :return: pd.DataFrame, with columns dropped.
-    """
     # Drop the id and country columns (redundant information)
-    vars_to_drop = ["country"]
+    vars_to_drop = ["id", "country"]
     for var in X.columns:
         vals = X[var].unique()
 
@@ -167,7 +126,7 @@ def drop(X):
     return X
 
 
-def preprocess(X_train, y_train, X_test, val_idx, preproc_dir=None):
+def preprocess(X_train, y_train, X_test, preproc_dir=None):
     # Replace -1's in y_train with 0's
     y_train = y_train.replace(-1, 0)
 
@@ -193,7 +152,7 @@ def preprocess(X_train, y_train, X_test, val_idx, preproc_dir=None):
 
     # Train-val split
     print("Generating a train-val data split...")
-    X_train, y_train, X_val, y_val = train_val_split(X_train, y_train, val_idx)
+    X_train, y_train, X_val, y_val = stratified_train_val_split(X_train, y_train)
 
     # Write the dfs to .csv files if applicable
     if len(os.listdir("preprocessed")) == 0 and preproc_dir:
@@ -226,24 +185,20 @@ def categorical_dmatrix(X):
 
 
 def select_features(X_train, X_val, X_test, xgb_model):
-    """
-    Apply a feature selection transformation (based on importance matrix from XGBoost) on train dnd test sets.
-    :param X_train: pd.DataFrame; train set
-    :param X_test: pd.DataFrame; test set
-    :param xgb_model: XGBoost Booster model.
-    :return: (pd.DataFrame, pd.DataFrame) (with only the selected features from XGBoost)
-    """
     # Get feature importance from XGBoost model (descending order)
     imp = xgb_model.feature_importances_
     ftr_idx = np.where(imp > cfg["XGBOOST"]["SELECTION"]["IMP_THRESH"])
-    ftr_select = []
 
-    # Get features with non-zero importance
     print("Selecting features based on gain...")
-    for idx in ftr_idx:
-        ftr_select.append(xgb_model.feature_names_in_[idx])
+    ftr_select = xgb_model.feature_names_in_[ftr_idx]
+    scores = xgb_model.feature_importances_[ftr_idx]
 
-    ftr_select = list(ftr_select[0])
+    df_rows = [[ftr, score] for ftr, score in zip(list(ftr_select), list(scores))]
+
+    importance_df = pd.DataFrame(df_rows, columns=["feature_name", "importance_gain"])
+    importance_df.to_csv("importance_matrix.csv")
+
+    ftr_select = list(ftr_select)
     print("{} features selected from XGBoost.".format(len(ftr_select)))
 
     # Feature selection
@@ -262,10 +217,15 @@ def write_pred_csv(pred_df, dest):
         pred_df.to_csv(pred_path, index_label="id")
 
 
-def pandas2numpy(X_train, X_val, X_test):
-    # One-hot-encode
+def pandas2numpy(X_train, X_val, X_test, preproc_dir):
+    # label-encode
     X = pd.concat([X_train, X_val, X_test])
-    X = pd.get_dummies(X)
+    le = LabelEncoder()
+    for var in X.columns:
+        if var == "fw_duration":
+            break
+        if X[var].dtype in ["category", "object"]:
+            X[var] = le.fit_transform(X[var])
 
     n_train, n_val = len(X_train), len(X_val)
 
@@ -273,10 +233,22 @@ def pandas2numpy(X_train, X_val, X_test):
     X_val = X.iloc[n_train:n_train+n_val]
     X_test = X.iloc[n_train+n_val:]
 
+    if len(os.listdir("preprocessed_numpy")) == 0 and preproc_dir:
+        if not os.path.exists(preproc_dir):
+            os.makedirs(preproc_dir)
+
+            X_train_path = os.path.join(preproc_dir, "X_train.csv")
+            X_val_path = os.path.join(preproc_dir, "X_val.csv")
+            X_test_path = os.path.join(preproc_dir, "X_test.csv")
+
+            X_train.to_csv(X_train_path, index=False)
+            X_val.to_csv(X_val_path, index=False)
+            X_test.to_csv(X_test_path, index=False)
+
     return np.array(X_train), np.array(X_val), np.array(X_test)
 
 
-# Convenience function for saving models
+# Convenience function for saving models_1
 def save_model_as_joblib(model):
     model_path = os.path.join(model_out, model.model + ".pkl")
     dump(model.trained, model_path)
@@ -351,3 +323,22 @@ def preprocess_xgboost(X_train, y_train, X_test, val_idx, preproc_dir=None):
     return X_train, y_train, X_val, y_val, X_test
 
 
+def undersample_majority_class(X, y):
+    y_counts = Counter(y).items()
+    y_counts = sorted(y_counts, key=lambda x: x[1])
+    min_count_label, min_count = y_counts[0]
+
+    X = X.reset_index(drop=True)
+    y = y.reset_index(drop=True)
+
+    full_df = pd.concat([X, y], axis=1)
+    for label, count in y_counts[1:]:
+        curr_label = full_df[full_df["label"] == label]
+        others = full_df[full_df["label"] != label]
+        curr_label_keep = curr_label.sample(frac=min_count/count)
+        full_df = pd.concat([others, curr_label_keep])
+
+    new_y_counts = sorted(Counter(full_df["label"]).items())
+    print(new_y_counts)
+
+    return full_df.drop(columns=["label"]), full_df["label"]

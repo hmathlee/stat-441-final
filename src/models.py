@@ -5,7 +5,6 @@ from joblib import load
 import pandas as pd
 import numpy as np
 from xgboost import XGBClassifier
-from sklearn.model_selection import GridSearchCV
 from sklearn.ensemble import RandomForestClassifier, StackingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import BaggingClassifier
@@ -13,7 +12,6 @@ from sklearn.svm import SVC
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import log_loss, accuracy_score
 from sklearn.neighbors import KNeighborsClassifier
-# from sklearn.utils.class_weight import compute_sample_weight
 
 # Torch
 import torch
@@ -47,7 +45,7 @@ class XGBoost:
             self.trained = XGBClassifier(n_estimators=self.xgb_cfg["ROUNDS"], objective="multi:softprob",
                                          eval_metric="mlogloss", enable_categorical=self.xgb_cfg["CATEGORICAL"],
                                          tree_method="hist", colsample_bytree=self.xgb_cfg["SUBSET"],
-                                         n_jobs=cfg["N_JOBS"])
+                                         n_jobs=cfg["N_JOBS"], gamma=1.54, random_state=cfg["SEED"])
 
             # Set tuning parameters
             self.trained.set_params(max_depth=self.xgb_cfg["DEPTH"][0], learning_rate=self.xgb_cfg["LR"][0],
@@ -83,8 +81,7 @@ class XGBoost:
         assert len(self.xgb_cfg["MIN_CHILD_WGT"]) == 1, \
             "Min child wgt parameter has length {} when 1 is required.".format(len(self.xgb_cfg["MIN_CHILD_WGT"]))
 
-        # weights = compute_sample_weight("balanced", y=y_train_new)
-        self.trained = self.trained.fit(X_train_new, y_train_new, eval_set=eval_set)
+        self.trained = self.trained.fit(X_train_new, y_train_new, eval_set=eval_set, early_stopping_rounds=10)
 
         save_model_as_joblib(self)
         eval_metrics = report_validation_metrics(self, X_val, y_val)
@@ -125,11 +122,12 @@ class RandomForest:
         else:
             self.trained = RandomForestClassifier(n_estimators=rf["N_TREES"], criterion="log_loss",
                                                   max_depth=rf["MAX_DEPTH"], min_samples_leaf=rf["MIN_CHILD_WGT"],
-                                                  max_features=rf["MAX_FTRS"], n_jobs=cfg["N_JOBS"], verbose=1)
+                                                  max_features=rf["MAX_FTRS"], n_jobs=cfg["N_JOBS"], verbose=1,
+                                                  max_samples=rf["MAX_SAMPLES"], random_state=cfg["SEED"])
 
     def train(self, X_train, y_train, X_val, y_val):
-        # Apply class weights
         self.trained.fit(X_train, y_train)
+
         train_pred = self.trained.predict_proba(X_train)
         train_pred_class = np.argmax(train_pred, axis=1)
         print("Random forest log loss (train):", log_loss(y_train, train_pred))
@@ -244,10 +242,7 @@ class NeuralNetwork:
         train_loader = DataLoader(dtrain, batch_size=cfg["NN"]["BATCH_SIZE"], shuffle=True)
         val_loader = DataLoader(dval, batch_size=cfg["NN"]["BATCH_SIZE"], shuffle=False)
 
-        # optim = SGD(self.net.parameters(), lr=cfg["NN"]["LR"], weight_decay=cfg["NN"]["L2_REG"],
-        #             momentum=cfg["NN"]["MOMENTUM"])
         optim = Rprop(self.net.parameters(), lr=cfg["NN"]["RPROP_LR"])
-        # scheduler = CosineAnnealingLR(optimizer=optim, T_max=cfg["NN"]["EPOCHS"])
 
         loss_fn = nn.NLLLoss().to(self.device)
 
@@ -343,10 +338,15 @@ class KNearest:
         if from_pickle:
             self.trained = load(os.path.join(model_out, self.model + ".pkl"))
         else:
-            self.trained = KNeighborsClassifier(n_neighbors=cfg["KNN"]["NEIGHBORS"])
+            self.trained = KNeighborsClassifier(n_neighbors=cfg["KNN"]["NEIGHBORS"], n_jobs=cfg["N_JOBS"])
 
     def train(self, X_train, y_train, X_val, y_val):
         self.trained.fit(X_train, y_train)
+
+        train_pred = self.trained.predict_proba(X_train)
+        train_pred_class = np.argmax(train_pred, axis=1)
+        print("KNN log loss (train):", log_loss(y_train, train_pred))
+        print("KNN accuracy (train):", accuracy_score(y_train, train_pred_class))
         
         save_model_as_joblib(self)
         eval_metrics = report_validation_metrics(self, X_val, y_val)
@@ -425,16 +425,12 @@ class ModelStack:
             xgb_cfg = cfg["XGBOOST"]["PREDICTION"]
             xgb = XGBoost(xgb_cfg)
             rf = RandomForest()
-            svm = SVM()
             knn = KNearest()
-            logistic = Logistic()
 
             self.estimators = [
                 ("xgboost", xgb.trained),
-                ("random forest", rf.trained)
-                # ("svm", svm.trained),
-                # ("knn", knn.trained),
-                # ("logistic", logistic.trained)
+                ("random forest", rf.trained),
+                ("knn", knn.trained)
             ]
 
             # Use XGBoost as the Level 1 estimator
@@ -442,12 +438,11 @@ class ModelStack:
             final_estimator = XGBClassifier(n_estimators=xgb_cfg["ROUNDS"], objective="multi:softprob",
                                             eval_metric="mlogloss", enable_categorical=xgb_cfg["CATEGORICAL"],
                                             tree_method="hist", colsample_bytree=xgb_cfg["SUBSET"],
-                                            n_jobs=cfg["N_JOBS"])
+                                            n_jobs=cfg["N_JOBS"], random_state=cfg["SEED"])
             final_estimator.set_params(max_depth=xgb_cfg["DEPTH"][0], learning_rate=xgb_cfg["LR"][0],
                                        min_child_weight=xgb_cfg["MIN_CHILD_WGT"][0])
-            # final_estimator = LogisticRegression()
 
-            cv = "prefit" if prefit else 2
+            cv = "prefit" if prefit else 3
             self.trained = StackingClassifier(estimators=self.estimators, final_estimator=final_estimator, cv=cv,
                                               verbose=2, n_jobs=cfg["N_JOBS"])
 

@@ -6,8 +6,17 @@ The goal of this project was to answer the question "How religious are you?", wh
 
 ## Models
 
+### Feature Selection
+- XGBoost
+- Lasso Regression (not used in final submission)
+
+### Prediction
 - XGBoost
 - Random Forest
 - KNN
+- Logistic Regression (not used in final submission)
+- SVM (not used in final submission)
 
+### Stacking
 - XGBoost Meta-Learner (Stacking)
+- Logistic Regression (not used in final submission)
